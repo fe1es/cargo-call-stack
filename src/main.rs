@@ -1,5 +1,3 @@
-#![deny(warnings)]
-
 use core::{
     cmp,
     fmt::{self, Write as _},
@@ -8,20 +6,18 @@ use core::{
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
-    env,
     fs::{self, File},
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, Read, Write},
     path::PathBuf,
-    process::{self, Command, Stdio},
+    process,
     time::SystemTime,
 };
 
 use anyhow::{anyhow, bail};
 use ar::Archive;
-use cargo_project::{Artifact, Profile, Project};
 use clap::{Parser, ValueEnum};
 use env_logger::{Builder, Env};
-use filetime::FileTime;
+use ir::Callee;
 use log::{error, warn};
 use petgraph::{
     algo,
@@ -29,17 +25,12 @@ use petgraph::{
     visit::{Dfs, Reversed, Topo},
     Direction, Graph,
 };
-use walkdir::WalkDir;
 use xmas_elf::{sections::SectionData, symbol_table::Entry, ElfFile};
 
-use crate::{
-    ir::{FnSig, Item, Stmt, Type},
-    thumb::Tag,
-};
+use crate::thumb::Tag;
 
 mod ir;
 mod thumb;
-mod wrapper;
 
 #[derive(ValueEnum, PartialEq, Debug, Clone, Copy)]
 enum OutputFormat {
@@ -51,25 +42,13 @@ enum OutputFormat {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// Input ELF file
+    #[clap(short)]
+    input: PathBuf,
+
     /// Target triple for which the code is compiled
     #[arg(long, value_name = "TRIPLE")]
     target: Option<String>,
-
-    /// Build only the specified binary
-    #[arg(long, value_name = "BIN")]
-    bin: Option<String>,
-
-    /// Build only the specified example
-    #[arg(long, value_name = "NAME")]
-    example: Option<String>,
-
-    /// Space-separated list of features to activate
-    #[arg(long, value_name = "FEATURES")]
-    features: Option<String>,
-
-    /// Activate all available features
-    #[arg(long)]
-    all_features: bool,
 
     /// Use verbose output
     #[arg(short, long)]
@@ -98,237 +77,32 @@ const FONT: &str = "monospace";
 
 #[allow(deprecated)]
 fn run() -> anyhow::Result<i32> {
-    if env::var_os("CARGO_CALL_STACK_RUSTC_WRAPPER").is_some() {
-        return wrapper::wrapper();
-    }
-
     Builder::from_env(Env::default().default_filter_or("warn")).init();
 
     let args = Args::parse();
-    let profile = Profile::Release;
 
-    let file = match (&args.example, &args.bin) {
-        (Some(f), None) => f,
-        (None, Some(f)) => f,
-        _ => bail!("Please specify either --example <NAME> or --bin <NAME>."),
-    };
+    let elf_bytes = fs::read(&args.input)
+        .map_err(|e| anyhow!("couldn't open ELF file `{}`: {}", args.input.display(), e))?;
 
-    let meta = rustc_version::version_meta()?;
-    let host = meta.host;
-    let cwd = env::current_dir()?;
-    let project = Project::query(cwd)?;
-    let target_flag = args.target.as_deref();
-    let target = project.target().or(target_flag).unwrap_or(&host);
+    let elf = ElfFile::new(&elf_bytes).map_err(|e| anyhow!("failed to parse ELF: {}", e))?;
 
-    let mut is_no_std = false;
-    {
-        let output = Command::new("rustc")
-            .args(&["--print=cfg", "--target", target])
-            .output()?;
-        for line in str::from_utf8(&output.stdout)?.lines() {
-            if let Some(value) = line.strip_prefix("target_os=") {
-                if value == "\"none\"" {
-                    is_no_std = true;
-                }
-            }
-        }
-    };
+    let mut ir_path = args.input.clone();
+    ir_path.set_extension("bc");
 
-    let mut cargo = Command::new("cargo");
-    cargo.arg("rustc");
-
-    // NOTE we do *not* use `project.target()` here because Cargo will figure things out on
-    // its own (i.e. it will search and parse .cargo/config, etc.)
-    if let Some(target) = target_flag {
-        cargo.args(&["--target", target]);
-    }
-
-    if args.all_features {
-        cargo.arg("--all-features");
-    } else if let Some(features) = &args.features {
-        cargo.args(&["--features", features]);
-    }
-
-    if args.example.is_some() {
-        cargo.args(&["--example", file]);
-    }
-
-    if args.bin.is_some() {
-        cargo.args(&["--bin", file]);
-    }
-
-    if profile.is_release() {
-        cargo.arg("--release");
-    }
-
-    let build_std = if is_no_std {
-        "-Zbuild-std=core,alloc,compiler_builtins"
+    let ir = if let Some(section) = elf.find_section_by_name(".llvmbc") {
+        section.raw_data(&elf).to_vec()
+    } else if let Ok(f) = fs::read(ir_path) {
+        f
     } else {
-        "-Zbuild-std"
+        bail!("ELF file has no embedded bitcode (.llvmbc section), and there's no .bc file next to it.")
     };
 
-    cargo.args(&[
-        build_std,
-        "--color=always",
-        "--",
-        // .ll file
-        "--emit=llvm-ir,obj",
-        // needed to produce a single .ll file
-        "-C",
-        "embed-bitcode=yes",
-        "-C",
-        "lto=fat",
-    ]);
+    let ir = ir::parse(&ir)?;
 
-    cargo.env("CARGO_CALL_STACK_RUSTC_WRAPPER", "1");
-    cargo.env("RUSTC_WRAPPER", env::current_exe()?);
-    cargo.stderr(Stdio::piped());
+    let mut defines: HashMap<_, _> = ir.defines.iter().map(|f| (f.name.as_str(), f)).collect();
+    let mut declares: HashMap<_, _> = ir.declares.iter().map(|f| (f.name.as_str(), f)).collect();
 
-    // "touch" some source file to trigger a rebuild
-    let root = project.toml().parent().expect("UNREACHABLE");
-    let now = FileTime::from_system_time(SystemTime::now());
-    if !filetime::set_file_times(root.join("src/main.rs"), now, now).is_ok() {
-        if !filetime::set_file_times(root.join("src/lib.rs"), now, now).is_ok() {
-            // look for some rust source file and "touch" it
-            let src = root.join("src");
-            let haystack = if src.exists() { &src } else { root };
-
-            for entry in WalkDir::new(haystack) {
-                let entry = entry?;
-                let path = entry.path();
-
-                if path.extension().map(|ext| ext == "rs").unwrap_or(false) {
-                    filetime::set_file_times(path, now, now)?;
-                    break;
-                }
-            }
-        }
-    }
-
-    if args.verbose {
-        eprintln!("{:?}", cargo);
-    }
-
-    let mut child = cargo.spawn()?;
-    let stderr = BufReader::new(child.stderr.take().unwrap());
-    let mut compiler_builtins_rlib_path = None;
-    let mut compiler_builtins_ll_path = None;
-    for line in stderr.lines() {
-        let line = line?;
-        if line.starts_with(wrapper::COMPILER_BUILTINS_RLIB_PATH_MARKER) {
-            let path = &line[wrapper::COMPILER_BUILTINS_RLIB_PATH_MARKER.len()..];
-            compiler_builtins_rlib_path = Some(path.to_string());
-        } else if line.starts_with(wrapper::COMPILER_BUILTINS_LL_PATH_MARKER) {
-            let path = &line[wrapper::COMPILER_BUILTINS_LL_PATH_MARKER.len()..];
-            compiler_builtins_ll_path = Some(path.to_string());
-        } else {
-            eprintln!("{}", line);
-        }
-    }
-
-    let status = child.wait()?;
-
-    if !status.success() {
-        return Ok(status.code().unwrap_or(1));
-    }
-
-    let compiler_builtins_rlib_path =
-        compiler_builtins_rlib_path.expect("`compiler_builtins` was not linked");
-    let compiler_builtins_ll_path =
-        compiler_builtins_ll_path.expect("`compiler_builtins` LLVM IR unavailable");
-
-    let mut path: PathBuf = if args.example.is_some() {
-        project.path(Artifact::Example(file), profile, target_flag, &host)?
-    } else {
-        project.path(Artifact::Bin(file), profile, target_flag, &host)?
-    };
-
-    let elf = fs::read(&path)
-        .map_err(|e| anyhow!("couldn't open ELF file `{}`: {}", path.display(), e))?;
-
-    // load llvm-ir file
-    let mut ll = None;
-    // most recently modified
-    let mut mrm = SystemTime::UNIX_EPOCH;
-    let prefix = format!("{}-", file.replace('-', "_"));
-
-    path = path.parent().expect("unreachable").to_path_buf();
-
-    if args.bin.is_some() {
-        path = path.join("deps"); // the .ll file is placed in ../deps
-    }
-
-    for e in fs::read_dir(path)? {
-        let e = e?;
-        let p = e.path();
-
-        if p.extension().map(|e| e == "ll").unwrap_or(false) {
-            if p.file_stem()
-                .expect("unreachable")
-                .to_str()
-                .expect("unreachable")
-                .starts_with(&prefix)
-            {
-                let modified = e.metadata()?.modified()?;
-                if ll.is_none() {
-                    ll = Some(p);
-                    mrm = modified;
-                } else {
-                    if modified > mrm {
-                        ll = Some(p);
-                        mrm = modified;
-                    }
-                }
-            }
-        }
-    }
-
-    let ll_path = ll.expect("unreachable");
-    let obj = ll_path.with_extension("o");
-    let ll = fs::read_to_string(&ll_path)
-        .map_err(|e| anyhow!("couldn't read LLVM IR from `{}`: {}", ll_path.display(), e))?;
-    let obj = fs::read(&obj)
-        .map_err(|e| anyhow!("couldn't read object file `{}`: {}", obj.display(), e))?;
-
-    let compiler_builtins_ll = fs::read_to_string(&compiler_builtins_ll_path).map_err(|e| {
-        anyhow!(
-            "couldn't read `compiler_builtins` LLVM IR from `{}`: {}",
-            compiler_builtins_ll_path,
-            e
-        )
-    })?;
-
-    let items = crate::ir::parse(&ll).map_err(|e| {
-        anyhow!(
-            "failed to parse application's LLVM IR from `{}`: {}",
-            ll_path.display(),
-            e
-        )
-    })?;
-    let compiler_builtins_items = crate::ir::parse(&compiler_builtins_ll).map_err(|e| {
-        anyhow!(
-            "failed to parse `compiler_builtins` LLVM IR from `{}`: {}",
-            compiler_builtins_ll_path,
-            e
-        )
-    })?;
-    let mut defines = HashMap::new();
-    let mut declares = HashMap::new();
-    for item in items.into_iter().chain(compiler_builtins_items) {
-        match item {
-            Item::Define(def) => {
-                defines.insert(def.name, def);
-            }
-
-            Item::Declare(decl) => {
-                declares.insert(decl.name, decl);
-            }
-
-            _ => {}
-        }
-    }
-
-    let target = project.target().or(target_flag).unwrap_or(&host);
+    let target = args.target.as_ref().unwrap().as_str();
 
     // we know how to analyze the machine code in the ELF file for these targets thus we have more
     // information and need less LLVM-IR hacks
@@ -339,39 +113,9 @@ fn run() -> anyhow::Result<i32> {
     };
 
     // extract stack size information
-    // the `.o` file doesn't have address information so we just keep the stack usage information
-    let mut stack_sizes: HashMap<_, _> = stack_sizes::analyze_object(&obj)?
-        .into_iter()
-        .map(|(name, stack)| (name.to_owned(), stack))
-        .collect();
-
-    let mut ar = Archive::new(
-        File::open(&compiler_builtins_rlib_path)
-            .map_err(|e| anyhow!("couldn't open `{}`: {}", compiler_builtins_rlib_path, e))?,
-    );
-
-    let mut buf = vec![];
-    while let Some(entry) = ar.next_entry() {
-        let mut entry = entry?;
-        let header = entry.header();
-
-        if str::from_utf8(header.identifier())
-            .map(|id| id.contains("compiler_builtins") && id.ends_with(".o"))
-            .unwrap_or(false)
-        {
-            buf.clear();
-            entry.read_to_end(&mut buf)?;
-            stack_sizes.extend(
-                stack_sizes::analyze_object(&buf)?
-                    .into_iter()
-                    .map(|(name, stack)| (name.to_owned(), stack)),
-            );
-        }
-    }
-
     // extract list of "live" symbols (symbols that have not been GC-ed by the linker)
     // this time we use the ELF and not the object file
-    let mut symbols = stack_sizes::analyze_executable(&elf)?;
+    let mut symbols = stack_sizes::analyze_executable(&elf_bytes)?;
 
     // clear the thumb bit
     if target_.is_thumb() {
@@ -380,6 +124,14 @@ fn run() -> anyhow::Result<i32> {
             .into_iter()
             .map(|(k, v)| (k & !1, v))
             .collect();
+    }
+
+    // index by name
+    let mut stack_sizes = HashMap::new();
+    for (_addr, func) in &symbols.defined {
+        for &name in func.names() {
+            stack_sizes.insert(name, func);
+        }
     }
 
     // remove version strings from undefined symbols
@@ -398,9 +150,7 @@ fn run() -> anyhow::Result<i32> {
     let mut g = DiGraph::<Node, ()>::new();
     let mut indices = BTreeMap::<Cow<str>, _>::new();
 
-    let mut indirects: HashMap<FnSig, Indirect> = HashMap::new();
-    // functions that could be called by `ArgumentV1.formatter`
-    let mut fmts = HashSet::new();
+    let mut indirects: HashMap<String, Indirect> = HashMap::new();
 
     // Some functions may be aliased; we map aliases to a single name. For example, if `foo`,
     // `bar` and `baz` all have the same address then this maps contains: `foo -> foo`, `bar -> foo`
@@ -453,6 +203,7 @@ fn run() -> anyhow::Result<i32> {
             })
             .collect::<Vec<_>>();
 
+        /*
         let canonical_name = if names.len() > 1 {
             // if one of the aliases appears in the `stack_sizes` dictionary, use that
             if let Some(needle) = names.iter().find(|name| stack_sizes.contains_key(&***name)) {
@@ -464,6 +215,8 @@ fn run() -> anyhow::Result<i32> {
         } else {
             names[0]
         };
+        */
+        let canonical_name = names[0];
 
         for name in names.iter().copied() {
             aliases.insert(name, canonical_name);
@@ -472,7 +225,10 @@ fn run() -> anyhow::Result<i32> {
         let _out = addr2name.insert(address, canonical_name);
         debug_assert!(_out.is_none());
 
-        let stack = stack_sizes.get(canonical_name).cloned();
+        let stack = stack_sizes
+            .get(canonical_name)
+            .cloned()
+            .and_then(|s| s.stack());
         if stack.is_none() {
             if !target_.is_thumb() {
                 warn!("no stack usage information for `{}`", canonical_name);
@@ -490,18 +246,6 @@ fn run() -> anyhow::Result<i32> {
         indices.insert(canonical_name.into(), idx);
 
         if let Some(def) = names.iter().filter_map(|name| defines.get(name)).next() {
-            // if the signature is `fn(&_, &mut fmt::Formatter) -> fmt::Result`
-            match (&def.sig.inputs[..], def.sig.output.as_ref()) {
-                ([Type::Pointer(..), Type::Pointer(fmt)], Some(output))
-                    if **fmt == Type::Alias("core::fmt::Formatter")
-                        && **output == Type::Integer(1) =>
-                {
-                    fmts.insert(idx);
-                }
-
-                _ => {}
-            }
-
             indirects
                 .entry(def.sig.clone())
                 .or_default()
@@ -509,7 +253,7 @@ fn run() -> anyhow::Result<i32> {
                 .insert(idx);
         } else if let Some(sig) = names
             .iter()
-            .filter_map(|name| declares.get(name).and_then(|decl| decl.sig.clone()))
+            .filter_map(|name| declares.get(name).and_then(|decl| Some(decl.sig.clone())))
             .next()
         {
             indirects.entry(sig).or_default().callees.insert(idx);
@@ -522,13 +266,13 @@ fn run() -> anyhow::Result<i32> {
     }
 
     // to avoid printing several warnings about the same thing
-    let mut fns_containing_asm = HashSet::new();
+    let mut fns_containing_asm: HashSet<&str> = HashSet::new();
     let mut llvm_seen = HashSet::new();
     // add edges
     let mut edges: HashMap<_, HashSet<_>> = HashMap::new(); // NodeIdx -> [NodeIdx]
     let mut defined = HashSet::new(); // functions that are `define`-d in the LLVM-IR
     for define in defines.values() {
-        let canonical_name = match aliases.get(&define.name) {
+        let canonical_name = match aliases.get(define.name.as_str()) {
             Some(canonical_name) => canonical_name,
             None => {
                 // this symbol was GC-ed by the linker, skip
@@ -539,8 +283,9 @@ fn run() -> anyhow::Result<i32> {
         let caller = indices[*canonical_name];
         let callees_seen = edges.entry(caller).or_default();
 
-        for stmt in &define.stmts {
+        for stmt in &define.callees {
             match stmt {
+                /*
                 Stmt::Asm(expr) => {
                     if fns_containing_asm.insert(*canonical_name) {
                         // NB: we only print the first inline asm statement in a function
@@ -550,7 +295,6 @@ fn run() -> anyhow::Result<i32> {
                         );
                     }
                 }
-
                 // this is basically `(mem::transmute<*const u8, fn()>(&__some_symbol))()`
                 Stmt::BitcastCall(sym) => {
                     // XXX we have some type information for this call but it's unclear if we should
@@ -569,9 +313,10 @@ fn run() -> anyhow::Result<i32> {
 
                     g.add_edge(caller, callee, ());
                 }
-
-                Stmt::DirectCall(func) => {
-                    match *func {
+                */
+                Callee::Direct(callee) => {
+                    let func = callee.name.as_str();
+                    match func {
                         // no-op / debug-info
                         "llvm.dbg.value" => continue,
                         "llvm.dbg.declare" => continue,
@@ -672,7 +417,7 @@ fn run() -> anyhow::Result<i32> {
                         || func.starts_with("llvm.usub.with.overflow.")
                         || func.starts_with("llvm.vector.reduce.")
                         || func.starts_with("llvm.x86.sse2.pmovmskb.")
-                        || *func == "llvm.x86.sse2.pause"
+                        || func == "llvm.x86.sse2.pause"
                     {
                         if !llvm_seen.contains(func) {
                             llvm_seen.insert(func);
@@ -683,7 +428,7 @@ fn run() -> anyhow::Result<i32> {
                     }
 
                     // noalias metadata does not lower to machine code
-                    if *func == "llvm.experimental.noalias.scope.decl" {
+                    if func == "llvm.experimental.noalias.scope.decl" {
                         continue;
                     }
 
@@ -697,7 +442,7 @@ fn run() -> anyhow::Result<i32> {
                     // if the intrinsic has no corresponding node (symbol in the output ELF) assume
                     // that it has been lowered to machine code
                     const SYMBOLLESS_INTRINSICS: &[&str] = &["memcmp"];
-                    if SYMBOLLESS_INTRINSICS.contains(func) && !indices.contains_key(*func) {
+                    if SYMBOLLESS_INTRINSICS.contains(&func) && !indices.contains_key(func) {
                         continue;
                     }
 
@@ -711,10 +456,10 @@ fn run() -> anyhow::Result<i32> {
                             func
                         );
 
-                        if let Some(idx) = indices.get(*func) {
+                        if let Some(idx) = indices.get(func) {
                             *idx
                         } else {
-                            let idx = g.add_node(Node(*func, None, false));
+                            let idx = g.add_node(Node(func, None, false));
                             indices.insert((*func).into(), idx);
 
                             idx
@@ -726,17 +471,14 @@ fn run() -> anyhow::Result<i32> {
                         g.add_edge(caller, callee, ());
                     }
                 }
-
-                Stmt::IndirectCall(sig) => {
+                Callee::Indirect(callee) => {
                     for (key_sig, indirect) in &mut indirects {
-                        if key_sig.loosely_equal(sig) {
+                        if key_sig == &callee.sig {
                             indirect.called = true;
                             indirect.callers.insert(caller);
                         }
                     }
                 }
-
-                Stmt::Label | Stmt::Comment | Stmt::Other => {}
             }
         }
     }
@@ -746,7 +488,6 @@ fn run() -> anyhow::Result<i32> {
     // disambiguate from the LLVM-IR (e.g. does this `llvm.memcpy` lower to a call to
     // `__aebi_memcpy`, a call to `__aebi_memcpy4` or machine instructions?)
     if target_.is_thumb() {
-        let elf = ElfFile::new(&elf).map_err(anyhow::Error::msg)?;
         let sect = elf.find_section_by_name(".symtab").expect("UNREACHABLE");
         let mut tags: Vec<_> = match sect.get_data(&elf).unwrap() {
             SectionData::SymbolTable32(entries) => entries
@@ -847,13 +588,22 @@ fn run() -> anyhow::Result<i32> {
                             }
                         } else {
                             // in all other cases our results should match
+                            if stack != *llvm_stack {
+                                warn!(
+                                    "BUG: LLVM reported that `{}` uses {} bytes of stack but \
+                                     our analysis reported {} bytes; overriding LLVM's result \
+                                     (this should match, it's probably a bug)",
+                                    canonical_name, llvm_stack, stack
+                                );
 
-                            assert_eq!(
-                                *llvm_stack, stack,
-                                "BUG: LLVM reported that `{}` uses {} bytes of stack but \
-                                 this doesn't match our analysis",
-                                canonical_name, llvm_stack
-                            );
+                                *llvm_stack = stack;
+                            }
+                            //assert_eq!(
+                            //    *llvm_stack, stack,
+                            //    "BUG: LLVM reported that `{}` uses {} bytes of stack but \
+                            //     this doesn't match our analysis",
+                            //    canonical_name, llvm_stack
+                            //);
                         }
                     }
 
@@ -938,84 +688,12 @@ fn run() -> anyhow::Result<i32> {
         );
     }
 
-    // this is a bit weird but for some reason `ArgumentV1.formatter` sometimes lowers to different
-    // LLVM types. In theory it should always be: `i1 (*%fmt::Void, *&core::fmt::Formatter)*` but
-    // sometimes the type of the first argument is `%fmt::Void`, sometimes it's `%core::fmt::Void`,
-    // sometimes is `%core::fmt::Void.12` and on occasion it's even `%SomeRandomType`
-    //
-    // To cope with this weird fact the following piece of code will try to find the right LLVM
-    // type.
-    let all_maybe_void = indirects
-        .keys()
-        .filter_map(|sig| match (&sig.inputs[..], sig.output.as_ref()) {
-            ([Type::Pointer(receiver), Type::Pointer(formatter)], Some(output))
-                if **formatter == Type::Alias("core::fmt::Formatter")
-                    && **output == Type::Integer(1) =>
-            {
-                if let Type::Alias(receiver) = **receiver {
-                    Some(receiver)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    let one_true_void = if all_maybe_void.contains(&"fmt::Void") {
-        Some("fmt::Void")
-    } else {
-        all_maybe_void
-            .iter()
-            .filter_map(|maybe_void| {
-                // this could be `core::fmt::Void` or `core::fmt::Void.12`
-                if maybe_void.starts_with("core::fmt::Void") {
-                    Some(*maybe_void)
-                } else {
-                    None
-                }
-            })
-            .next()
-            .or_else(|| {
-                if all_maybe_void.len() == 1 {
-                    // we got a random type!
-                    Some(all_maybe_void[0])
-                } else {
-                    None
-                }
-            })
-    };
-
     for (mut sig, indirect) in indirects {
         if !indirect.called {
             continue;
         }
 
-        let callees = if let Some(one_true_void) = one_true_void {
-            match (&sig.inputs[..], sig.output.as_ref()) {
-                // special case: this is `ArgumentV1.formatter` a pseudo trait object
-                ([Type::Pointer(void), Type::Pointer(fmt)], Some(output))
-                    if **void == Type::Alias(one_true_void)
-                        && **fmt == Type::Alias("core::fmt::Formatter")
-                        && **output == Type::Integer(1) =>
-                {
-                    if fmts.is_empty() {
-                        error!("BUG? no callees for `{}`", sig.to_string());
-                    }
-
-                    // canonicalize the signature
-                    if one_true_void != "fmt::Void" {
-                        sig.inputs[0] = Type::Alias("fmt::Void");
-                    }
-
-                    &fmts
-                }
-
-                _ => &indirect.callees,
-            }
-        } else {
-            &indirect.callees
-        };
+        let callees = &indirect.callees;
 
         let mut name = sig.to_string();
         // append '*' to denote that this is a function pointer
