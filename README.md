@@ -15,7 +15,7 @@ Other examples:
 
 **HEADS UP**: This tool relies on an experimental feature (`-Z stack-sizes`)
 and implementation details of `rustc` (like symbol mangling) and could stop
-working with a nightly toolchain at any time. You have been warned! Last tested nightly: 2022-09-20.
+working with a nightly toolchain at any time. You have been warned! Last tested nightly: 2023-06-28.
 
 **NOTE**: This tool main use case are embedded (microcontroller) programs that lack, or have very
 little, indirect function calls and recursion. This tool is of very limited use -- specially its
@@ -23,6 +23,14 @@ stack usage analysis -- on programs that link to the standard library as even th
 that links to the standard library will contain a large number of indirect function calls (like
 trait object dynamic dispatch specially in `core::fmt`) and potential recursion (specially in
 panicking branches).
+
+## Differences from `japaric/cargo-call-stack`
+
+- Analyzes the binary you've built yourself, instead of building it for you with custom flags.
+  - Guarantees the binary you've analyzed and the binary you've deployed are the same.
+  - Doesn't need a custom rustc wrapper.
+  - However, it can't analyze functions from `compiler-builtins` because it's compiled separately, not as part of LTO, so LLVM bitcode for it is not available. [This PR](https://github.com/rust-lang/rust/pull/113923) will solve this.
+- Uses the LLVM library to parse binary LLVM bitcode, instead of a custom parser for the LLVM IR text format. Faster, and hopefully less likely to break when the LLVM IR text format changes.
 
 ## Features
 
@@ -59,39 +67,57 @@ panicking branches).
 
 ``` console
 $ # NOTE always use the latest stable release
-$ cargo +stable install cargo-call-stack
+$ cargo +stable install --git https://github.com/Dirbaio/cargo-call-stack
 
 $ rustup +nightly component add rust-src
 ```
 
 ## Example usage
 
-> **NOTE** this tool requires that your Cargo project is configured to use *fat LTO* when Cargo uses
-> the release profile. This is not the default configuration (as of Rust 1.63) so you'll need to add
-> this to your `Cargo.toml`:
+- Configure your Cargo project to use *fat LTO*.
+  This is not the default configuration (as of Rust 1.63) so you'll need to add this to your `Cargo.toml`:
 
-``` toml
+```toml
 [profile.release]
-# `lto = true` should also work
 lto = 'fat'
+```
+
+- Configure the linker to embed LLVM bitcode inside the final ELF. Add this to `.cargo/config.toml`:
+
+```toml
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+rustflags = [
+  "-Zemit-stack-sizes",
+  "-Clinker-plugin-lto",
+  "-Clink-arg=-mllvm=-lto-embed-bitcode=optimized",
+  "-Clink-arg=-mllvm=-stack-size-section",
+]
+```
+
+- It is recommended to use `build-std` so that libcore compiler flags match your main binary's. Add this to `.cargo/config.toml`:
+
+```toml
+[unstable]
+build-std = ["compiler_builtins", "core"]
+```
+
+- Build your project in release mode:
+
+```
+$ cargo build --release
+```
+
+- Then run `cargo-call-stack`. This analyses your binary and then prints a dot file to stdout.
+
+```
+$ cargo-call-stack -i target/thumbv7em-none-eabi/release/your-binary-name > cg.dot
 ```
 
 The tool builds your program in release mode with LTO enabled, analyses it and
 then prints a dot file to stdout. See `cargo call-stack -h` for a list of build
 options (e.g. `--features`).
 
-[`cortex-m-rt`]: https://crates.io/crates/cortex-m-rt
-
-> IMPORTANT: the analysis corresponds to the newly produced binary,
-> which won't be the same as the binary produced by `cargo +nightly build --release`
-
-``` console
-$ cargo +nightly call-stack --example app > cg.dot
-warning: assuming that llvm_asm!("") does *not* use the stack
-warning: assuming that llvm_asm!("") does *not* use the stack
-```
-
-Graphviz's `dot` can then be used to generate an image from this dot file.
+- Graphviz's `dot` can then be used to generate an image from this dot file.
 
 ``` console
 $ dot -Tsvg cg.dot > cg.svg
