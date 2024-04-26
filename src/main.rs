@@ -645,9 +645,13 @@ fn run() -> anyhow::Result<i32> {
                 for offset in bls {
                     let addr = (address as i64 + i64::from(offset)) as u64;
                     // address may be off by one due to the thumb bit being set
-                    let name = addr2name
-                        .get(&addr)
-                        .unwrap_or_else(|| panic!("BUG? no symbol at address {}", addr));
+                    let name = match addr2name.get(&addr) {
+                        Some(name) => name,
+                        None => {
+                            warn!("BUG? no symbol at address {}", addr);
+                            continue
+                        },
+                    };
 
                     let callee = indices[*name];
                     if !callees_seen.contains(&callee) {
@@ -663,9 +667,13 @@ fn run() -> anyhow::Result<i32> {
                         // intra-function B branches are not function calls
                     } else {
                         // address may be off by one due to the thumb bit being set
-                        let name = addr2name
-                            .get(&(addr as u64))
-                            .unwrap_or_else(|| panic!("BUG? no symbol at address {}", addr));
+                        let name = match addr2name.get(&(addr as u64)) {
+                            Some(name) => name,
+                            None => {
+                                warn!("BUG? no symbol at address {}", addr);
+                                continue
+                            },
+                        };
 
                         let callee = indices[*name];
                         if !callees_seen.contains(&callee) {
